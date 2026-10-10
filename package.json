@@ -1,0 +1,11 @@
+{
+  "name": "omp-better-diff",
+  "version": "0.1.0",
+  "description": "OpenCode-style diff rendering for omp's edit/apply_patch tool cards",
+  "type": "module",
+  "main": "index.ts",
+  "omp": {
+    "extensions": ["./index.ts"]
+  },
+  "private": true
+}
