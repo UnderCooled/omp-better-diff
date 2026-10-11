@@ -10,11 +10,11 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { framedToolCard } from "@oh-my-pi/pi-tui/render";
 import { toolRenderers, type ToolRenderer } from "@oh-my-pi/pi-tui/tools";
-import { getLanguageFromPath, type Theme } from "@oh-my-pi/pi-tui/theme";
+import { getLanguageFromPath, highlightCode, type Theme } from "@oh-my-pi/pi-tui/theme";
 import { visibleWidth, type Component } from "@oh-my-pi/pi-tui";
 import {
 	DEFAULT_DIFF_CONFIG,
-	type DiffConfig,
+	type ContextHighlighter,
 	type DiffMode,
 	type DiffTheme,
 	parseDiff,
@@ -214,6 +214,15 @@ export default function ompBetterDiff(pi: ExtensionAPI) {
 				};
 				const facts = readHeadFacts(result.details, args);
 
+				// Unedited lines are syntax-colored when the path names a language
+				// the host's highlighter knows; changed rows keep the flat
+				// add/remove foreground and their inverse emphasis. A run of
+				// context lines is handed over joined, so a multi-line construct
+				// tokenizes with its real context.
+				const language = facts.path === "" ? undefined : getLanguageFromPath(facts.path);
+				const highlight: ContextHighlighter | undefined = language
+					? lines => highlightCode(lines.join("\n"), language, theme)
+					: undefined;
 				// The host's card shell owns the frame, background, and padding;
 				// we contribute the top bar and the rows inside it. The meter is
 				// padded out with border glyphs so it lands near the bar's right
@@ -234,7 +243,7 @@ export default function ompBetterDiff(pi: ExtensionAPI) {
 						header: meter
 							? `${label} ${theme.fg("borderMuted", theme.boxRound.horizontal.repeat(gap))} ${meter}`
 							: label,
-						sections: [{ content: renderDiffBody(parsed, contentWidth, diffTheme, state, options.expanded) }],
+						sections: [{ content: renderDiffBody(parsed, contentWidth, diffTheme, state, options.expanded, highlight) }],
 						phase: result.isError ? "error" : options.isPartial ? "partial" : "success",
 						borderColor: result.isError ? "error" : "borderMuted",
 						contentPaddingLeft: 0,
