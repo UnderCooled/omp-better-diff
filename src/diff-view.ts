@@ -325,8 +325,8 @@ export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme,
 	// Both code columns are padded to their own width; the emphasis is
 	// computed on the narrower of the two so the styled core is identical on
 	// either side, and the wider side pads the rest inside its row tint.
-	const leftCode = Math.max(1, leftWidth - numWidth);
-	const rightCode = Math.max(1, rightWidth - numWidth);
+	const leftCode = Math.max(0, leftWidth - numWidth);
+	const rightCode = Math.max(0, rightWidth - numWidth);
 	const pairWidth = Math.min(leftCode, rightCode);
 
 	const rows: string[] = [];
@@ -351,7 +351,10 @@ export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme,
 		}
 		const paired = Math.min(removed.length, added.length);
 		for (let i = 0; i < Math.max(removed.length, added.length); i++) {
-			if (i < paired) {
+			// A pair needs room in both columns to share one clipped core; when
+			// either column is too narrow the pair falls through to the same
+			// untinted cells as a surplus row.
+			if (i < paired && pairWidth > 0) {
 				// Index-aligned rows get word-level emphasis; surplus rows fall
 				// back to `cell` and stay untinted, as in the unified layout.
 				const removeLine = removed[i] as DiffLine;
