@@ -234,32 +234,30 @@ function gutterCell(kind: DiffLineKind, number: string, numWidth: number, theme:
 	return paintGutter(theme, theme.fg(GUTTER_COLOR[kind], number.padStart(numWidth, " ")));
 }
 
-/** Unified rows: number gutter, change marker, tinted code. Every row is `width` wide. */
-export function renderUnified(parsed: ParsedDiff, width: number, theme: DiffTheme, rowMarker: RowMarker): string[] {
-	const numWidth = Math.max(GUTTER_MIN_WIDTH, ...parsed.lines.map(line => line.number.length));
-	const codeWidth = Math.max(1, width - numWidth - 1);
-	const row = (kind: DiffLineKind, number: string, code: string): string => {
-		// The divider doubles as the change marker: a shaded cell on changed rows
-		// in hatch mode, the plain rule otherwise.
-		const changed = kind !== "context";
-		const divider = rowMarker === "hatch" && changed ? HATCH_MARK : "│";
-		return `${gutterCell(kind, number, numWidth, theme)}${theme.fg(changed ? LINE_COLOR[kind] : "dim", divider)}${code}`;
-	};
+/** Gutter width: the widest line number in the diff, never narrower than the marker column. */
+function gutterWidth(parsed: ParsedDiff): number {
+	return parsed.lines.reduce((width, line) => Math.max(width, line.number.length), GUTTER_MIN_WIDTH);
+}
 
-	const rows: string[] = [];
+type DiffBlock =
+	| { kind: "context"; line: DiffLine }
+	| { kind: "change"; removed: DiffLine[]; added: DiffLine[] };
+
+/**
+ * A diff as consecutive context rows and change blocks, where a change block is
+ * every removal followed by every addition. Every layout walks these blocks;
+ * they differ only in how many rows a change block expands to.
+ */
+function* iterateBlocks(parsed: ParsedDiff): Generator<DiffBlock> {
 	let index = 0;
-
 	while (index < parsed.lines.length) {
 		const head = parsed.lines[index];
-		if (!head) break;
+		if (!head) return;
 		if (head.kind === "context") {
-			rows.push(row("context", head.number, fit(head.content, codeWidth)));
+			yield { kind: "context", line: head };
 			index++;
 			continue;
 		}
-
-		// A change block is every consecutive removal followed by every
-		// consecutive addition; index-aligned pairs get inline emphasis.
 		const removed: DiffLine[] = [];
 		while (parsed.lines[index]?.kind === "remove") {
 			removed.push(parsed.lines[index] as DiffLine);
@@ -270,12 +268,69 @@ export function renderUnified(parsed: ParsedDiff, width: number, theme: DiffThem
 			added.push(parsed.lines[index] as DiffLine);
 			index++;
 		}
+		yield { kind: "change", removed, added };
+	}
+}
+
+/**
+ * Rows a diff expands to before any styling, which is what a collapsed card
+ * hides. The two layouts disagree: unified and compact stack every removal and
+ * addition as its own row, while split folds a change block into one
+ * side-by-side row per aligned index.
+ */
+export function countStackedRows(parsed: ParsedDiff): number {
+	let rows = 0;
+	for (const block of iterateBlocks(parsed)) {
+		rows += block.kind === "context" ? 1 : block.removed.length + block.added.length;
+	}
+	return rows;
+}
+
+/** Rows the split layout expands to — one side-by-side row per aligned index. */
+export function countSplitRows(parsed: ParsedDiff): number {
+	let rows = 0;
+	for (const block of iterateBlocks(parsed)) {
+		rows += block.kind === "context" ? 1 : Math.max(block.removed.length, block.added.length);
+	}
+	return rows;
+}
+
+/** Unified rows: number gutter, change marker, tinted code. Every row is `width` wide. */
+export function renderUnified(
+	parsed: ParsedDiff,
+	width: number,
+	theme: DiffTheme,
+	rowMarker: RowMarker,
+	rowLimit = Number.POSITIVE_INFINITY,
+): string[] {
+	const numWidth = gutterWidth(parsed);
+	const codeWidth = Math.max(1, width - numWidth - 1);
+	const row = (kind: DiffLineKind, number: string, code: string): string => {
+		// The divider doubles as the change marker: a shaded cell on changed rows
+		// in hatch mode, the plain rule otherwise.
+		const changed = kind !== "context";
+		const divider = rowMarker === "hatch" && changed ? HATCH_MARK : "│";
+		return `${gutterCell(kind, number, numWidth, theme)}${theme.fg(changed ? LINE_COLOR[kind] : "dim", divider)}${code}`;
+	};
+
+	const rows: string[] = [];
+	for (const block of iterateBlocks(parsed)) {
+		// The gutter is derived from the whole diff, so stopping here keeps the
+		// visible prefix byte-identical to the same rows of the full render.
+		if (rows.length >= rowLimit) break;
+		if (block.kind === "context") {
+			rows.push(row("context", block.line.number, fit(block.line.content, codeWidth)));
+			continue;
+		}
+
+		// Index-aligned pairs get inline emphasis; surplus rows stay untinted.
+		const { removed, added } = block;
 		const paired = Math.min(removed.length, added.length);
 
 		for (let i = 0; i < paired; i++) {
 			const removeLine = removed[i] as DiffLine;
 			const addLine = added[i] as DiffLine;
-			// Fit both sides first: emphasis is computed on already-fitted text,
+			// Clip both sides first: emphasis is computed on already-clipped text,
 			// so the emphasized rows keep the same width as every other row.
 			const emphasis = fitPair(removeLine.content, addLine.content, codeWidth, theme);
 			rows.push(row("remove", removeLine.number, theme.fg("toolDiffRemoved", emphasis.removed)));
@@ -291,15 +346,21 @@ export function renderUnified(parsed: ParsedDiff, width: number, theme: DiffThem
 		}
 	}
 
-	return rows;
+	return rows.length > rowLimit ? rows.slice(0, rowLimit) : rows;
 }
 
 /** Two columns; a side with no counterpart renders as blanks so rows stay aligned. */
-export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme, rowMarker: RowMarker): string[] {
+export function renderSplit(
+	parsed: ParsedDiff,
+	width: number,
+	theme: DiffTheme,
+	rowMarker: RowMarker,
+	rowLimit = Number.POSITIVE_INFINITY,
+): string[] {
 	const separatorWidth = visibleWidth(SPLIT_SEPARATOR);
 	const leftWidth = Math.max(MIN_SPLIT_COLUMN_WIDTH, Math.floor((width - separatorWidth) / 2));
 	const rightWidth = width - separatorWidth - leftWidth;
-	const numWidth = Math.max(GUTTER_MIN_WIDTH, ...parsed.lines.map(line => line.number.length));
+	const numWidth = gutterWidth(parsed);
 	const separator = theme.fg("dim", SPLIT_SEPARATOR);
 
 	const cell = (line: DiffLine | undefined, side: "left" | "right", columnWidth: number): string => {
@@ -330,33 +391,21 @@ export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme,
 	const pairWidth = Math.min(leftCode, rightCode);
 
 	const rows: string[] = [];
-	let index = 0;
-	while (index < parsed.lines.length) {
-		const head = parsed.lines[index];
-		if (!head) break;
-		if (head.kind === "context") {
-			rows.push(`${cell(head, "left", leftWidth)}${separator}${cell(head, "right", rightWidth)}`);
-			index++;
+	for (const block of iterateBlocks(parsed)) {
+		// The gutter is derived from the whole diff, so stopping here keeps the
+		// visible prefix byte-identical to the same rows of the full render.
+		if (rows.length >= rowLimit) break;
+		if (block.kind === "context") {
+			rows.push(`${cell(block.line, "left", leftWidth)}${separator}${cell(block.line, "right", rightWidth)}`);
 			continue;
 		}
-		const removed: DiffLine[] = [];
-		while (parsed.lines[index]?.kind === "remove") {
-			removed.push(parsed.lines[index] as DiffLine);
-			index++;
-		}
-		const added: DiffLine[] = [];
-		while (parsed.lines[index]?.kind === "add") {
-			added.push(parsed.lines[index] as DiffLine);
-			index++;
-		}
+		const { removed, added } = block;
 		const paired = Math.min(removed.length, added.length);
 		for (let i = 0; i < Math.max(removed.length, added.length); i++) {
 			// A pair needs room in both columns to share one clipped core; when
 			// either column is too narrow the pair falls through to the same
 			// untinted cells as a surplus row.
 			if (i < paired && pairWidth > 0) {
-				// Index-aligned rows get word-level emphasis; surplus rows fall
-				// back to `cell` and stay untinted, as in the unified layout.
 				const removeLine = removed[i] as DiffLine;
 				const addLine = added[i] as DiffLine;
 				const core = fitPair(removeLine.content, addLine.content, pairWidth, theme);
@@ -368,11 +417,17 @@ export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme,
 			rows.push(`${cell(removed[i], "left", leftWidth)}${rule(removed[i], added[i])}${cell(added[i], "right", rightWidth)}`);
 		}
 	}
-	return rows;
+	return rows.length > rowLimit ? rows.slice(0, rowLimit) : rows;
 }
 
 /** One indicator column, no gutters — for narrow panes. */
-export function renderCompact(parsed: ParsedDiff, width: number, theme: DiffTheme, rowMarker: RowMarker): string[] {
+export function renderCompact(
+	parsed: ParsedDiff,
+	width: number,
+	theme: DiffTheme,
+	rowMarker: RowMarker,
+	rowLimit = Number.POSITIVE_INFINITY,
+): string[] {
 	const codeWidth = Math.max(1, width - 2);
 	const row = (line: DiffLine, code: string): string => {
 		const marker = rowMarker === "hatch" && line.kind !== "context" ? HATCH_MARK : line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " ";
@@ -380,27 +435,17 @@ export function renderCompact(parsed: ParsedDiff, width: number, theme: DiffThem
 	};
 
 	const rows: string[] = [];
-	let index = 0;
-	while (index < parsed.lines.length) {
-		const head = parsed.lines[index];
-		if (!head) break;
-		if (head.kind === "context") {
-			rows.push(row(head, fit(head.content, codeWidth)));
-			index++;
+	for (const block of iterateBlocks(parsed)) {
+		// The gutter is derived from the whole diff, so stopping here keeps the
+		// visible prefix byte-identical to the same rows of the full render.
+		if (rows.length >= rowLimit) break;
+		if (block.kind === "context") {
+			rows.push(row(block.line, fit(block.line.content, codeWidth)));
 			continue;
-		}
-		const removed: DiffLine[] = [];
-		while (parsed.lines[index]?.kind === "remove") {
-			removed.push(parsed.lines[index] as DiffLine);
-			index++;
-		}
-		const added: DiffLine[] = [];
-		while (parsed.lines[index]?.kind === "add") {
-			added.push(parsed.lines[index] as DiffLine);
-			index++;
 		}
 		// Same pairing as the unified layout: index-aligned rows get word-level
 		// emphasis, surplus rows render plain.
+		const { removed, added } = block;
 		const paired = Math.min(removed.length, added.length);
 		for (let i = 0; i < paired; i++) {
 			const removeLine = removed[i] as DiffLine;
@@ -417,7 +462,7 @@ export function renderCompact(parsed: ParsedDiff, width: number, theme: DiffThem
 			rows.push(row(line, fit(line.content, codeWidth)));
 		}
 	}
-	return rows;
+	return rows.length > rowLimit ? rows.slice(0, rowLimit) : rows;
 }
 
 /**
@@ -478,18 +523,21 @@ export function renderDiffBody(parsed: ParsedDiff, width: number, theme: DiffThe
 	const mode = resolveDiffMode(config, width);
 	if (mode === "summary") return [renderSummaryRow(parsed, width)];
 
-	const rows =
-		mode === "split" && width >= MIN_SPLIT_COLUMN_WIDTH * 2 + visibleWidth(SPLIT_SEPARATOR)
-			? renderSplit(parsed, width, theme, config.rowMarker)
-			: mode === "compact"
-				? renderCompact(parsed, width, theme, config.rowMarker)
-				: renderUnified(parsed, width, theme, config.rowMarker);
+	// Only the rows the card will show get styled: the per-pair word diff is
+	// the expensive part of a render, and a collapsed card hides everything
+	// past this budget. The gutter still comes from the whole diff, so
+	// expanding adds rows without re-padding the ones already on screen.
+	const limit = expanded ? Number.POSITIVE_INFINITY : Math.max(1, config.collapsedLines);
+	const splitLayout = mode === "split" && width >= MIN_SPLIT_COLUMN_WIDTH * 2 + visibleWidth(SPLIT_SEPARATOR);
+	const rows = splitLayout
+		? renderSplit(parsed, width, theme, config.rowMarker, limit)
+		: mode === "compact"
+			? renderCompact(parsed, width, theme, config.rowMarker, limit)
+			: renderUnified(parsed, width, theme, config.rowMarker, limit);
 
-	const limit = expanded ? rows.length : Math.max(1, config.collapsedLines);
-	const clamped = rows.slice(0, limit);
-	const hidden = rows.length - clamped.length;
+	const hidden = Math.max(0, (splitLayout ? countSplitRows(parsed) : countStackedRows(parsed)) - rows.length);
 
-	const body = [...clamped];
+	const body = [...rows];
 	if (hidden > 0) {
 		body.push("");
 		// Fit the plain text first, then color it: styling before the fit would
