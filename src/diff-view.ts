@@ -189,12 +189,26 @@ function applySpans(text: string, spans: Array<[number, number]>, theme: DiffThe
 }
 
 /**
+ * Trim plain text to at most `width` columns, without padding. Kept separate
+ * from `fit` so a caller can emphasize the clipped text and pad afterwards:
+ * diffing padded text lets the trailing spaces join the last changed token,
+ * which would paint the whole right side of the row as changed.
+ */
+function clip(text: string, width: number): string {
+	return truncateToWidth(replaceTabs(text), width);
+}
+
+/**
  * Fit both sides of a `-`/`+` pair to `width` and return their emphasized
  * cores, without the outer row tint. Callers wrap the result in the row's own
  * `fg` so the tint still covers the whole code column.
  */
 function fitPair(removedText: string, addedText: string, width: number, theme: DiffTheme): { removed: string; added: string } {
-	return emphasisPair(fit(removedText, width), fit(addedText, width), theme);
+	const removed = clip(removedText, width);
+	const added = clip(addedText, width);
+	const emphasized = emphasisPair(removed, added, theme);
+	const pad = (clipped: string): string => " ".repeat(Math.max(0, width - visibleWidth(clipped)));
+	return { removed: emphasized.removed + pad(removed), added: emphasized.added + pad(added) };
 }
 
 /**
@@ -203,7 +217,7 @@ function fitPair(removedText: string, addedText: string, width: number, theme: D
  * sequence and leak a background or inverse into the next cell.
  */
 function fit(text: string, width: number): string {
-	const clipped = truncateToWidth(replaceTabs(text), width);
+	const clipped = clip(text, width);
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
 }
 
