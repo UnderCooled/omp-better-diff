@@ -189,6 +189,15 @@ function applySpans(text: string, spans: Array<[number, number]>, theme: DiffThe
 }
 
 /**
+ * Fit both sides of a `-`/`+` pair to `width` and return their emphasized
+ * cores, without the outer row tint. Callers wrap the result in the row's own
+ * `fg` so the tint still covers the whole code column.
+ */
+function fitPair(removedText: string, addedText: string, width: number, theme: DiffTheme): { removed: string; added: string } {
+	return emphasisPair(fit(removedText, width), fit(addedText, width), theme);
+}
+
+/**
  * Fit plain text to exactly `width` columns before it is colored. Styling is
  * applied only after the fit, so a truncated row can never cut an escape
  * sequence and leak a background or inverse into the next cell.
@@ -254,7 +263,7 @@ export function renderUnified(parsed: ParsedDiff, width: number, theme: DiffThem
 			const addLine = added[i] as DiffLine;
 			// Fit both sides first: emphasis is computed on already-fitted text,
 			// so the emphasized rows keep the same width as every other row.
-			const emphasis = emphasisPair(fit(removeLine.content, codeWidth), fit(addLine.content, codeWidth), theme);
+			const emphasis = fitPair(removeLine.content, addLine.content, codeWidth, theme);
 			rows.push(row("remove", removeLine.number, theme.fg("toolDiffRemoved", emphasis.removed)));
 			rows.push(row("add", addLine.number, theme.fg("toolDiffAdded", emphasis.added)));
 		}
@@ -299,6 +308,13 @@ export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme,
 		return kind ? ` ${theme.fg(LINE_COLOR[kind], HATCH_MARK)} ` : separator;
 	};
 
+	// Both code columns are padded to their own width; the emphasis is
+	// computed on the narrower of the two so the styled core is identical on
+	// either side, and the wider side pads the rest inside its row tint.
+	const leftCode = Math.max(1, leftWidth - numWidth);
+	const rightCode = Math.max(1, rightWidth - numWidth);
+	const pairWidth = Math.min(leftCode, rightCode);
+
 	const rows: string[] = [];
 	let index = 0;
 	while (index < parsed.lines.length) {
@@ -319,7 +335,19 @@ export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme,
 			added.push(parsed.lines[index] as DiffLine);
 			index++;
 		}
+		const paired = Math.min(removed.length, added.length);
 		for (let i = 0; i < Math.max(removed.length, added.length); i++) {
+			if (i < paired) {
+				// Index-aligned rows get word-level emphasis; surplus rows fall
+				// back to `cell` and stay untinted, as in the unified layout.
+				const removeLine = removed[i] as DiffLine;
+				const addLine = added[i] as DiffLine;
+				const core = fitPair(removeLine.content, addLine.content, pairWidth, theme);
+				const left = `${gutterCell("remove", removeLine.number, numWidth, theme)}${theme.fg(LINE_COLOR.remove, core.removed + " ".repeat(leftCode - pairWidth))}`;
+				const right = `${gutterCell("add", addLine.number, numWidth, theme)}${theme.fg(LINE_COLOR.add, core.added + " ".repeat(rightCode - pairWidth))}`;
+				rows.push(`${left}${rule(removeLine, addLine)}${right}`);
+				continue;
+			}
 			rows.push(`${cell(removed[i], "left", leftWidth)}${rule(removed[i], added[i])}${cell(added[i], "right", rightWidth)}`);
 		}
 	}
@@ -329,11 +357,50 @@ export function renderSplit(parsed: ParsedDiff, width: number, theme: DiffTheme,
 /** One indicator column, no gutters — for narrow panes. */
 export function renderCompact(parsed: ParsedDiff, width: number, theme: DiffTheme, rowMarker: RowMarker): string[] {
 	const codeWidth = Math.max(1, width - 2);
-	return parsed.lines.map(line => {
+	const row = (line: DiffLine, code: string): string => {
 		const marker = rowMarker === "hatch" && line.kind !== "context" ? HATCH_MARK : line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " ";
-		const code = fit(line.content, codeWidth);
 		return `${theme.fg(GUTTER_COLOR[line.kind], marker)} ${theme.fg(LINE_COLOR[line.kind], code)}`;
-	});
+	};
+
+	const rows: string[] = [];
+	let index = 0;
+	while (index < parsed.lines.length) {
+		const head = parsed.lines[index];
+		if (!head) break;
+		if (head.kind === "context") {
+			rows.push(row(head, fit(head.content, codeWidth)));
+			index++;
+			continue;
+		}
+		const removed: DiffLine[] = [];
+		while (parsed.lines[index]?.kind === "remove") {
+			removed.push(parsed.lines[index] as DiffLine);
+			index++;
+		}
+		const added: DiffLine[] = [];
+		while (parsed.lines[index]?.kind === "add") {
+			added.push(parsed.lines[index] as DiffLine);
+			index++;
+		}
+		// Same pairing as the unified layout: index-aligned rows get word-level
+		// emphasis, surplus rows render plain.
+		const paired = Math.min(removed.length, added.length);
+		for (let i = 0; i < paired; i++) {
+			const removeLine = removed[i] as DiffLine;
+			const addLine = added[i] as DiffLine;
+			const core = fitPair(removeLine.content, addLine.content, codeWidth, theme);
+			rows.push(row(removeLine, core.removed), row(addLine, core.added));
+		}
+		for (let i = paired; i < removed.length; i++) {
+			const line = removed[i] as DiffLine;
+			rows.push(row(line, fit(line.content, codeWidth)));
+		}
+		for (let i = paired; i < added.length; i++) {
+			const line = added[i] as DiffLine;
+			rows.push(row(line, fit(line.content, codeWidth)));
+		}
+	}
+	return rows;
 }
 
 /**
