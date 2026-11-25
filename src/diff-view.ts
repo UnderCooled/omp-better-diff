@@ -10,7 +10,7 @@
  * the layout logic is unit-testable without a terminal.
  */
 import { diffWords } from "@oh-my-pi/pi-natives";
-import { replaceTabs, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import { replaceTabs, truncate, visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 
 export type DiffLineKind = "add" | "remove" | "context";
 
@@ -205,7 +205,7 @@ function applySpans(text: string, spans: Array<[number, number]>, theme: DiffThe
  * which would paint the whole right side of the row as changed.
  */
 function clip(text: string, width: number): string {
-	return truncateToWidth(replaceTabs(text), width);
+	return truncate(replaceTabs(text), width);
 }
 
 /**
@@ -573,7 +573,7 @@ export function renderSummaryRow(parsed: ParsedDiff, width: number): string {
 	for (const candidate of candidates) {
 		if (visibleWidth(candidate) <= width) return candidate;
 	}
-	return truncateToWidth(candidates[candidates.length - 1] ?? "", width, "");
+	return truncate(candidates[candidates.length - 1] ?? "", width, "");
 }
 
 /**

@@ -2,19 +2,19 @@
  * omp-better-diff — OpenCode-style diff cards for omp's `edit` / `apply_patch`
  * tool rows.
  *
- * The extension replaces the built-in renderer's `renderResult` slot only. The
- * call row, streaming preview, expansion state, diagnostics, and multi-file
- * fan-out stay owned by the host renderer; we only re-lay the settled diff and
- * rebuild the card's top bar (operation, path, `[+n/-n]`, add/remove meter).
+ * The extension shadows the host `edit` tool only to supply `renderResult`.
+ * The call row, streaming preview, expansion state, diagnostics and multi-file
+ * fan-out stay owned by the host renderer; the header row is rebuilt here.
  */
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { framedToolCard } from "@oh-my-pi/pi-tui/render";
-import { toolRenderers, type ToolRenderer } from "@oh-my-pi/pi-tui/tools";
-import { getLanguageFromPath, highlightCode, type Theme } from "@oh-my-pi/pi-tui/theme";
-import { visibleWidth, type Component } from "@oh-my-pi/pi-tui";
+import { applyPatchSchema, type ExtensionAPI, type ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { highlightCode } from "@oh-my-pi/pi-tui/text/highlight";
+import { languageFromPath } from "@oh-my-pi/pi-tui/text/lang";
+import { truncate, visibleWidth } from "@oh-my-pi/pi-tui/text/width";
+
 import {
 	DEFAULT_DIFF_CONFIG,
 	type ContextHighlighter,
+	type DiffConfig,
 	type DiffMode,
 	type DiffTheme,
 	parseDiff,
@@ -24,19 +24,13 @@ import {
 	type RowMarker,
 } from "./src/diff-view.js";
 
-/** Border columns kept after the meter before the bar's right cap. */
-const METER_TAIL_WIDTH = 4;
-/** Below this card width the styled layout degrades to the native renderer. */
-const MIN_STYLED_WIDTH = 100;
 /** Blend strength for the line-number gutter fill. */
 const GUTTER_TINT_RATIO = 0.6;
-const PATCHED_TOOLS = ["edit", "apply_patch"] as const;
 const VALID_MODES: DiffMode[] = ["auto", "split", "unified", "compact", "summary"];
 const VALID_MARKERS: RowMarker[] = ["hatch", "none"];
-/** Frame corners the top bar spends: `╭───` left, `╮` right, plus its label padding. */
-const BAR_CHROME_WIDTH = 6;
 
 const state: DiffConfig = { ...DEFAULT_DIFF_CONFIG };
+type EditToolDefinition = ToolDefinition & { customWireName?: string };
 
 /** Pull the diff payload out of a renderer result without assuming its shape. */
 function readDiff(details: unknown): string {
@@ -51,49 +45,33 @@ function readDiff(details: unknown): string {
 	return typeof diff === "string" ? diff : "";
 }
 
-/** Operation, path, and rename for the top bar, derived like the host derives them. */
-interface EditHeadFacts {
-	title: string;
-	path: string;
-	rename?: string;
-}
-
-const OP_TITLES: Record<string, string> = { create: "Create", delete: "Delete", update: "Edit" };
-
-function readHeadFacts(details: unknown, args: unknown): EditHeadFacts {
+/** The edited path, for language detection. */
+function readPath(details: unknown, args: unknown): string {
 	const detail = typeof details === "object" && details !== null ? (details as Record<string, unknown>) : {};
 	const arg = typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
-	const firstString = (...values: unknown[]): string | undefined => {
-		for (const value of values) {
-			if (typeof value === "string" && value !== "") return value;
-		}
-		return undefined;
-	};
-	const op = firstString(detail.op, arg.op);
-	const path = firstString(detail.path, arg.file_path, arg.path) ?? "";
-	const sourcePath = firstString(detail.sourcePath);
-	const moveTarget = firstString(detail.move, arg.rename, arg.move);
-	// A moved file reports both ends: render it as `source → destination`.
-	if (sourcePath && path && sourcePath !== path) {
-		return { title: (op && OP_TITLES[op]) || "Edit", path: sourcePath, rename: path };
+	for (const value of [detail.path, arg.file_path, arg.path, detail.sourcePath]) {
+		if (typeof value === "string" && value !== "") return value;
 	}
-	return {
-		title: (op && OP_TITLES[op]) || "Edit",
-		path: firstString(sourcePath, path) ?? "",
-		rename: moveTarget,
-	};
+	return "";
 }
 
-/** `Edit: <icon> path [+7/-1]` — change count inside the bracket pair. */
-function renderHeaderLabel(facts: EditHeadFacts, added: number, removed: number, theme: Theme): string {
-	const title = theme.fg("accent", facts.title);
-	const target = facts.rename ? `${facts.path} → ${facts.rename}` : facts.path;
-	// A pathless edit (a failed call that still carries a diff) must not print
-	// a dangling colon before the bracket pair.
-	const line = target
-		? `${title}: ${theme.getLangIconStyled(getLanguageFromPath(facts.path))} ${theme.fg("muted", target)}`
-		: title;
-	return added + removed === 0 ? line : `${line} ${renderStatsBracket(added, removed, theme)}`;
+/** `Edit: <icon> path [+7/-1] ━━━━[━━━━━]` — label plus right-aligned meter. */
+function renderHeaderRow(
+	path: string,
+	added: number,
+	removed: number,
+	width: number,
+	theme: HeaderTheme,
+): string {
+	const title = theme.fg("accent", "Edit");
+	const target = path
+		? `${theme.fg("muted", theme.symbols.langIcon(languageFromPath(path)))} ${theme.fg("muted", path)}`
+		: "";
+	const label = `${target ? `${title}: ${target}` : title}${added + removed === 0 ? "" : ` ${renderStatsBracket(added, removed, theme)}`}`;
+	const meter = renderStatMeter(added, removed, Math.max(0, width - visibleWidth(label) - 8), theme);
+	if (!meter) return truncate(label, width, "");
+	const gap = Math.max(1, width - visibleWidth(label) - visibleWidth(meter) - 4);
+	return truncate(`${label} ${theme.fg("borderMuted", theme.symbols.box.horizontal.repeat(gap))} ${meter}`, width, "");
 }
 
 /** Parse `#rgb`/`#rrggbb` into channels; `undefined` for anything else. */
@@ -117,6 +95,20 @@ function toSrgb(linear: number): number {
 	return Math.round(Math.min(1, Math.max(0, channel)) * 255);
 }
 
+/** The theme fields {@link blendBg} needs; `ExtensionTheme` satisfies this. */
+interface BlendTheme {
+	readonly depth: string;
+	hex(color: string): string;
+}
+
+/** The theme fields {@link renderHeaderRow} needs; `ExtensionTheme` satisfies this. */
+interface HeaderTheme extends DiffTheme {
+	symbols: {
+		langIcon(lang: string | undefined): string;
+		box: { horizontal: string };
+	};
+}
+
 /**
  * Blend `tint` over `base` and emit a truecolor background escape. Returns
  * `undefined` on a 256-color terminal or an unparsable color, so the caller
@@ -128,8 +120,8 @@ function toSrgb(linear: number): number {
  * `rgb(22,26,31)` card — a contrast ratio of 1.17, which is invisible in
  * practice. Mixing in linear light gives `rgb(112,33,42)` for the same ratio.
  */
-function blendBg(theme: Theme, base: string, tint: string, ratio: number): string | undefined {
-	if (theme.getColorMode() !== "truecolor") return undefined;
+function blendBg(theme: BlendTheme, base: string, tint: string, ratio: number): string | undefined {
+	if (theme.depth !== "truecolor") return undefined;
 	const from = parseHex(base);
 	const to = parseHex(tint);
 	if (!from || !to) return undefined;
@@ -190,77 +182,64 @@ export default function ompBetterDiff(pi: ExtensionAPI) {
 		},
 	});
 
-	for (const toolName of PATCHED_TOOLS) {
-		const renderer = toolRenderers[toolName] as ToolRenderer | undefined;
-		if (!renderer?.renderResult) {
-			pi.logger.warn(`better-diff: no built-in renderer for ${toolName}; skipped`);
-			continue;
-		}
-
-		toolRenderers[toolName] = {
-			...renderer,
-			renderResult(result, options, theme, args) {
-				const diffText = readDiff(result.details);
-				// A delete/move or a failed edit carries no diff; defer to the host.
-				if (diffText.trim() === "") return renderer.renderResult?.(result, options, theme, args);
-
-				const parsed = parseDiff(diffText);
-				const cardBg = theme.getBgHex(result.isError ? "toolErrorBg" : options.isPartial ? "toolPendingBg" : "toolSuccessBg");
-				const diffTheme: DiffTheme = {
-					fg: (color, text) => theme.fg(color as Parameters<typeof theme.fg>[0], text),
-					bold: text => theme.bold(text),
-					inverse: text => theme.inverse(text),
-					gutterBg: () => blendBg(theme, cardBg, theme.getColorHex("borderMuted"), GUTTER_TINT_RATIO),
-				};
-				const facts = readHeadFacts(result.details, args);
-
-				// Unedited lines are syntax-colored when the path names a language
-				// the host's highlighter knows; changed rows keep the flat
-				// add/remove foreground and their inverse emphasis. A run of
-				// context lines is handed over joined, so a multi-line construct
-				// tokenizes with its real context.
-				const language = facts.path === "" ? undefined : getLanguageFromPath(facts.path);
-				const highlight: ContextHighlighter | undefined = language
-					? lines => highlightCode(lines.join("\n"), language, theme)
-					: undefined;
-				// The host's card shell owns the frame, background, and padding;
-				// we contribute the top bar and the rows inside it. The meter is
-				// padded out with border glyphs so it lands near the bar's right
-				// edge; the shell fills whatever width is left over.
-				const card = framedToolCard(theme, ({ width, contentWidth }) => {
-					const label = renderHeaderLabel(facts, parsed.added, parsed.removed, theme);
-					const barBudget = width - BAR_CHROME_WIDTH;
-					const meter = renderStatMeter(
-						parsed.added,
-						parsed.removed,
-						barBudget - visibleWidth(label) - 4,
-						diffTheme,
-					);
-					// Reserve a short tail so the meter is flanked by border runs on
-					// both sides rather than sitting flush against the right cap.
-					const gap = meter ? Math.max(1, barBudget - visibleWidth(label) - visibleWidth(meter) - METER_TAIL_WIDTH) : 0;
-					return {
-						header: meter
-							? `${label} ${theme.fg("borderMuted", theme.boxRound.horizontal.repeat(gap))} ${meter}`
-							: label,
-						sections: [{ content: renderDiffBody(parsed, contentWidth, diffTheme, state, options.expanded, highlight) }],
-						phase: result.isError ? "error" : options.isPartial ? "partial" : "success",
-						borderColor: result.isError ? "error" : "borderMuted",
-						contentPaddingLeft: 0,
+	pi.on("session_start", () => {
+		try {
+			const edit = pi.getAllTools().find(tool => tool.name === "edit");
+			if (!edit) {
+				pi.logger.warn("better-diff: no edit tool registered; skipped");
+				return;
+			}
+			const definition: EditToolDefinition = {
+				name: "edit",
+				label: "Edit",
+				description: edit.description,
+				parameters: edit.parameters,
+				strict: true,
+				loadMode: "essential",
+				// shortcut: approval tier approximated (write; exec for URL targets), always-ask-cached grants not replicated; upgrade by delegating to the native tool's approval decision.
+				approval: args => (readPath(args, {}).includes("://") ? "exec" : "write"),
+				async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+					if (!ctx.invokeTool) throw new Error("better-diff: native edit tool unavailable");
+					return ctx.invokeTool(params as unknown as Record<string, unknown>);
+				},
+				renderResult(result, options, theme, args) {
+					const diffText = readDiff(result.details);
+					// A delete/move or a failed edit carries no diff: draw the host's
+					// result text so the terminal body is not left blank.
+					if (diffText.trim() === "") {
+						const text = result.content
+							.flatMap(part => (part.type === "text" && typeof part.text === "string" ? [part.text] : []))
+							.filter(part => part.length > 0);
+						return text.length > 0 ? { render: () => text } : undefined;
+					}
+					const parsed = parseDiff(diffText);
+					const cardBg = theme.hex(result.isError ? "toolErrorBg" : options.isPartial ? "toolPendingBg" : "toolSuccessBg");
+					const diffTheme: DiffTheme = {
+						fg: (color, text) => theme.fg(color, text),
+						bold: text => theme.bold(text),
+						inverse: text => theme.inverse(text),
+						gutterBg: () => blendBg(theme, cardBg, theme.hex("borderMuted"), GUTTER_TINT_RATIO),
 					};
-				});
-
-				const native = (): Component | undefined => renderer.renderResult?.(result, options, theme, args);
-				// Below the threshold a split pane has no room for two columns and
-				// a rescaled header only adds clutter, so the host card takes over.
-				return {
-					render: width => (width < MIN_STYLED_WIDTH ? (native()?.render(width) ?? []) : card.render(width)),
-					invalidate: () => {
-						card.invalidate?.();
-						native()?.invalidate?.();
-					},
-				};
-			},
-		};
-	}
+					const path = readPath(result.details, args);
+					// Unedited lines are syntax-colored when the path names a language
+					// the host's highlighter knows; changed rows keep the flat
+					// add/remove foreground and their inverse emphasis.
+					const language = path === "" ? undefined : languageFromPath(path);
+					const highlight: ContextHighlighter | undefined = language
+						? lines => highlightCode(lines.join("\n"), language, theme)
+						: undefined;
+					return {
+						render: (width: number) => [
+							renderHeaderRow(path, parsed.added, parsed.removed, width, theme),
+							...renderDiffBody(parsed, width, diffTheme, state, options.expanded, highlight),
+						],
+					};
+				},
+			};
+			if (edit.parameters === applyPatchSchema) definition.customWireName = "apply_patch";
+			pi.registerTool(definition);
+		} catch (error) {
+			pi.logger.warn(`better-diff: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	});
 }

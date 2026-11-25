@@ -2,11 +2,11 @@
 
 OpenCode 风格的 diff 卡片，替换 omp 内置 `edit` / `apply_patch` 工具结果的渲染。
 
-内置渲染器把 diff 画成一条扁平的着色行流；本扩展重新排版同一份 `details.diff`，给出分栏 / 统一 / 紧凑 / 摘要四种布局，并重建卡片顶栏的操作、路径、`[+n/-n]` 与增删进度条。
+内置渲染器把 diff 画成一条扁平的着色行流；本扩展重新排版同一份 `details.diff`，给出分栏 / 统一 / 紧凑 / 摘要四种布局，并重建标题行（操作、路径、`[+n/-n]`、增删进度条）。
 
 ## 特性
 
-- **顶栏**：`Edit: <lang icon> src/foo.ts [+7/-1] ━━━━[━━━━━]`，左侧是操作与目标路径（含 `source → dest` 移动），右侧是按增删比例着色的进度条。
+- **标题行**：`Edit: <lang icon> src/foo.ts [+7/-1] ━━━━[━━━━━]`，左侧是操作与目标路径，右侧是按增删比例着色的进度条。
 - **分栏 (split)**：左右两列，删行在左、增行在右、上下文两侧重复；中间分隔列同时充当改动标记。
 - **统一 (unified)**：行号槽 + 改动标记 + 代码三段式，行号槽带混合背景色，与代码本体在视觉上分离。
 - **行内词级高亮**：位置对齐的 `-` / `+` 行对，用 inverse 标出真正改动的词，与宿主自己的行内处理保持一致。
@@ -68,7 +68,7 @@ disabledExtensions:
 
 ## 使用
 
-扩展加载后自动接管 `edit` 与 `apply_patch` 两个工具的 `renderResult`，无需额外开关。配置用斜杠命令：
+扩展在 `session_start` 时读取宿主的 `edit` 工具定义，注册同名工具：`execute` 通过 `ctx.invokeTool` 委托回原生实现，`renderResult` 提供标题行与 diff 行。`edit.mode: apply_patch` 时额外声明 `customWireName: "apply_patch"`，让线名仍解析到本工具。无需额外开关。配置用斜杠命令：
 
 ```text
 /better-diff                    # 打印当前配置
@@ -102,34 +102,33 @@ disabledExtensions:
 | `auto`，宽度 `≥ 110` | `split` |
 | `auto`，宽度 `< 110` | `unified` |
 
-此外整个卡片宽度 `< 100` 时（分栏放不下两列、顶栏也没有余量），直接回退到宿主自己的渲染器。
-
 ## 实现
 
 ```text
-index.ts          扩展入口：接管渲染器 + /better-diff 命令 + 顶栏拼装
+index.ts          扩展入口：注册同名 edit 工具 + /better-diff 命令
 src/diff-view.ts  纯函数：diff 解析、四种布局、统计片段、折叠
 ```
 
-- 只替换 `toolRenderers[tool].renderResult` 这一个槽位；调用行、流式预览、展开状态、诊断信息、多文件分叉仍归宿主所有。`renderCall` / 流式阶段不受影响。
-- 拿不到 diff 就交给宿主：删除 / 移动、失败的编辑、多文件结果（`perFileResults.length !== 1`）都不走本扩展。
+- `execute` 通过 `ctx.invokeTool` 委托回原生 `edit`；调用行、流式预览、展开状态、诊断信息、多文件分叉仍归宿主所有。`renderCall` / 流式阶段不受影响。
+- 拿不到 diff 时绘制宿主结果文本：删除 / 移动、失败的编辑、多文件结果（`perFileResults.length !== 1`）都不会留下空白正文。
 - `src/diff-view.ts` 除注入的 `DiffTheme` 外不查任何主题，因此可以脱离终端单测。
 - 行号槽背景是把卡片背景与 `borderMuted` 在**线性光**下按 0.6 混合后输出的 truecolor 转义；sRGB 直接插值在暗端会把差异压没（16% 比例下对比度只有 1.17）。非 truecolor 终端返回 `undefined`，静默降级为无底色，绝不输出残缺转义。
 - 所有布局行先按纯文本裁到目标宽度再上色，裁切永远不会切断 ANSI 转义序列而把背景色漏到后面。
-- 上下文行的语法色走宿主的 `highlightCode`（同进程 NAPI，不 spawn 外部进程）：按 `getLanguageFromPath(path)` 识别语言，识别不出就完全跳过。语法高亮只作用于卡片将要显示的行，与折叠预算同一个上限——1000 行的 diff 全量上色约 157ms，而折叠态只上色 24 行约 4.5ms。
+- 上下文行的语法色走宿主的 `highlightCode`（同进程 NAPI，不 spawn 外部进程）：按 `languageFromPath(path)` 识别语言，识别不出就完全跳过。语法高亮只作用于卡片将要显示的行，与折叠预算同一个上限——1000 行的 diff 全量上色约 157ms，而折叠态只上色 24 行约 4.5ms。
 - 改动行不做语法高亮是有意的：宿主自己的渲染器也把 context 行交高亮器、改动行交 inverse 行内 diff，两者从不叠在同一行上。叠上去会让反色块不再统一是红 / 绿，行的增删语义只剩行号槽与 `░` 承担。
 
 ## 已知限制
 
 - 只覆盖 `edit` 与 `apply_patch`；`write`、`ast_edit` 等仍用宿主渲染。
-- 一次编辑多个文件时不显示 diff 卡片，回退到宿主的多文件列表。
+- 一次编辑多个文件时不显示 diff 卡片，回退到宿主结果文本。
 - `splitMinWidth` 无运行时入口。
 - 语言识别不出（无路径、无扩展名、未知后缀）时上下文行不着色，输出与加高亮之前逐字节相同。
+- 同名工具委托原生执行，但审批 tier 近似为 `write`（URL 目标为 `exec`）；`always-ask-cached` 的按目标记忆未复刻。
 - 扩展与宿主同进程、无沙箱；`disabledExtensions` 是唯一的事前停用手段。
 
 ## 验证
 
 1. `omp` 启动后确认扩展已加载（`/better-diff` 能打印 `mode=auto splitMinWidth=110 collapsedLines=24 rowMarker=hatch`）。
-2. 让模型做一次 `edit`，检查卡片顶栏的 `[+n/-n]` 与进度条、以及行号槽。
+2. 让模型做一次 `edit`，检查标题行的路径、`[+n/-n]` 与进度条，以及行号槽。
 3. `/better-diff split` 后再编辑一次，确认切到分栏；把终端拖窄，确认按 `auto` 阈值降级且行不溢出。
-4. 编辑一个已在 `getLanguageFromPath` 表内的文件（如 `.ts`），确认未改动的上下文行有语法色、而 `-`/`+` 行仍是纯红 / 绿 + inverse 词级高亮；再编辑一个无扩展名文件，确认上下文行退回无色。
+4. 编辑一个已在 `languageFromPath` 表内的文件（如 `.ts`），确认未改动的上下文行有语法色、而 `-`/`+` 行仍是纯红 / 绿 + inverse 词级高亮；再编辑一个无扩展名文件，确认上下文行退回无色。
